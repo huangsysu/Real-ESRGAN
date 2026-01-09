@@ -54,10 +54,20 @@ def find_matching_files(ref_dir: Path, source_dir: Path, recursive: bool = False
         list: 匹配的源文件路径列表 [(source_file, relative_path), ...]
     """
     # 获取参考目录中所有 PNG 文件名
+    # 注意：Windows 上 *.png 和 *.PNG 会匹配相同文件，需要去重
     if recursive:
-        ref_files = list(ref_dir.rglob('*.png')) + list(ref_dir.rglob('*.PNG'))
+        ref_files_raw = list(ref_dir.rglob('*.png')) + list(ref_dir.rglob('*.PNG'))
     else:
-        ref_files = list(ref_dir.glob('*.png')) + list(ref_dir.glob('*.PNG'))
+        ref_files_raw = list(ref_dir.glob('*.png')) + list(ref_dir.glob('*.PNG'))
+
+    # 使用路径字符串去重（Windows 不区分大小写）
+    ref_files_seen = set()
+    ref_files = []
+    for f in ref_files_raw:
+        key = str(f).lower()
+        if key not in ref_files_seen:
+            ref_files_seen.add(key)
+            ref_files.append(f)
 
     # 提取文件名（去重）
     ref_names = set()
@@ -67,10 +77,20 @@ def find_matching_files(ref_dir: Path, source_dir: Path, recursive: bool = False
     log(f"参考目录中找到 {len(ref_names)} 个唯一 PNG 文件名")
 
     # 在源目录中查找匹配的文件
+    # 同样需要去重
     if recursive:
-        source_files = list(source_dir.rglob('*.png')) + list(source_dir.rglob('*.PNG'))
+        source_files_raw = list(source_dir.rglob('*.png')) + list(source_dir.rglob('*.PNG'))
     else:
-        source_files = list(source_dir.glob('*.png')) + list(source_dir.glob('*.PNG'))
+        source_files_raw = list(source_dir.glob('*.png')) + list(source_dir.glob('*.PNG'))
+
+    # 使用路径字符串去重
+    source_files_seen = set()
+    source_files = []
+    for f in source_files_raw:
+        key = str(f).lower()
+        if key not in source_files_seen:
+            source_files_seen.add(key)
+            source_files.append(f)
 
     log(f"源目录中共有 {len(source_files)} 个 PNG 文件")
 
@@ -99,7 +119,11 @@ def process_matched_files(
     overwrite: bool = False,
     final_size: int = None,
     io_workers: int = 4,
-    queue_size: int = 10
+    queue_size: int = 10,
+    output_8bit: bool = False,
+    use_palette: bool = False,
+    face_enhance: bool = False,
+    resize_method: str = 'area'
 ) -> int:
     """
     处理匹配的文件列表
@@ -114,6 +138,10 @@ def process_matched_files(
         final_size: 最终输出尺寸（超分后降采样）
         io_workers: I/O 线程数量（并行模式）
         queue_size: 队列大小（并行模式）
+        output_8bit: 是否强制输出为 8-bit 位深度
+        use_palette: 是否使用调色板模式输出（减小文件大小）
+        face_enhance: 是否使用 GFPGAN 进行人脸增强
+        resize_method: 缩放算法 (area/lanczos/cubic/linear/nearest)
 
     Returns:
         int: 返回码
@@ -127,7 +155,11 @@ def process_matched_files(
         model_name=model_name,
         scale=scale,
         fp32=True,  # 默认使用 FP32
-        final_size=final_size
+        final_size=final_size,
+        output_8bit=output_8bit,
+        use_palette=use_palette,
+        face_enhance=face_enhance,
+        resize_method=resize_method
     )
 
     # 转换为 process_file_list 所需的格式: [(input_path, relative_path), ...]
@@ -172,7 +204,7 @@ def parse_args():
 
     # 可选参数
     parser.add_argument('--model', type=str, default='RealESRGAN_x4plus',
-                        choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B', 'RealESRGAN_x2plus'],
+                        choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B', 'RealESRGAN_x2plus','RealESRNet_x4plus'],
                         help='模型名称 (默认: RealESRGAN_x4plus)')
     parser.add_argument('--scale', type=int, default=4,
                         help='放大倍数 (默认: 4)')
@@ -194,6 +226,17 @@ def parse_args():
     # 后处理选项
     parser.add_argument('--final-size', type=int, default=None,
                         help='最终输出尺寸，超分后降采样到此尺寸 (例如: --scale 2 --final-size 120)')
+    parser.add_argument('--resize-method', type=str, default='area',
+                        choices=['area', 'lanczos', 'cubic', 'linear', 'nearest'],
+                        help='缩放算法: area(抗锯齿), lanczos(锐利), cubic(平滑), linear, nearest(像素风) (默认: area)')
+    parser.add_argument('--8bit', dest='output_8bit', action='store_true',
+                        help='强制输出为 8-bit 位深度 PNG（某些游戏引擎需要）')
+    parser.add_argument('--palette', action='store_true',
+                        help='使用调色板模式输出 PNG（8-bit 索引色，大幅减小文件大小）')
+
+    # 人脸增强选项
+    parser.add_argument('--face-enhance', action='store_true',
+                        help='使用 GFPGAN 进行人脸增强（需要安装 gfpgan 包）')
 
     return parser.parse_args()
 
@@ -255,7 +298,11 @@ def main():
         overwrite=args.overwrite,
         final_size=args.final_size,
         io_workers=args.io_workers,
-        queue_size=args.queue_size
+        queue_size=args.queue_size,
+        output_8bit=args.output_8bit,
+        use_palette=args.palette,
+        face_enhance=args.face_enhance,
+        resize_method=args.resize_method
     )
 
     sys.exit(return_code)

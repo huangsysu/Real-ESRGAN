@@ -61,7 +61,7 @@ cd D:\Tools\Real-ESRGAN
 **方式一：从 Git 克隆（首次部署）**
 
 ```cmd
-git clone https://github.com/xinntao/Real-ESRGAN.git .
+git clone https://github.com/huangsysu/Real-ESRGAN.git .
 ```
 
 **方式二：从 SVN 检出（后续更新）**
@@ -163,6 +163,7 @@ python scripts/batch_process.py -i <输入路径> -o <输出目录> [选项]
 | `--io-workers` | | I/O 线程数量 | `4` |
 | `--queue-size` | | 队列大小（控制内存） | `10` |
 | `--final-size` | | 最终输出尺寸（超分后降采样） | `None` |
+| `--palette` | | 使用调色板模式压缩 PNG（减小文件大小） | `False` |
 
 #### 使用示例
 
@@ -312,6 +313,7 @@ python scripts/process_by_reference.py --ref <参考目录> --source <源目录>
 | `--parallel` | 启用并行处理模式 | `False` |
 | `--io-workers` | I/O 线程数量 | `4` |
 | `--final-size` | 最终输出尺寸（超分后降采样） | `None` |
+| `--palette` | 使用调色板模式压缩 PNG（减小文件大小） | `False` |
 
 #### 使用示例
 
@@ -329,7 +331,62 @@ python scripts/process_by_reference.py --ref E:\ref\item --source G:\source\item
 python scripts/process_by_reference.py --ref E:\ref --source G:\source --output D:\output --scale 2 --final-size 120 --parallel --io-workers 8 --recursive --overwrite
 ```
 
-### 3.5 返回码
+### 3.5 调色板模式压缩（--palette）
+
+当需要减小输出 PNG 文件大小时，可以使用 `--palette` 参数将 32 位 RGBA 图像转换为 8 位索引色/调色板模式。
+
+#### 适用场景
+
+- **游戏 UI 资源**：图标、按钮等颜色数量有限的素材
+- **像素艺术**：原始素材就是低色彩数的图像
+- **文件大小敏感**：需要匹配原始游戏资源的文件大小
+
+#### 工作原理
+
+```
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│   AI 超分辨率     │ ──→ │  自适应调色板     │ ──→ │   8位索引色PNG    │
+│  32位 RGBA 输出  │     │  256色量化       │     │  文件大小约 1/4   │
+└──────────────────┘     └──────────────────┘     └──────────────────┘
+                          (PIL.Image.ADAPTIVE)
+```
+
+1. **超分处理**：Real-ESRGAN 输出 32 位 RGBA 图像（约 30KB）
+2. **调色板量化**：使用 PIL 的自适应算法提取最优 256 色调色板
+3. **保存压缩**：输出 8 位索引色 PNG（约 8KB，减小约 75%）
+
+#### 使用示例
+
+```cmd
+:: 超分 + 调色板压缩
+python scripts/batch_process.py -i D:\res -o D:\output --palette
+
+:: 完整流程：超分 → 降采样 → 调色板压缩
+python scripts/batch_process.py -i D:\res -o D:\output --scale 2 --final-size 120 --palette
+
+:: 结合并行模式
+python scripts/batch_process.py -i D:\res -o D:\output --parallel --palette
+
+:: process_by_reference.py 同样支持
+python scripts/process_by_reference.py --ref E:\ref --source G:\source --output D:\output --palette
+```
+
+#### 注意事项
+
+- 仅对 **PNG 格式** 生效，其他格式会忽略此选项
+- 调色板模式最多支持 **256 色**，对渐变丰富的图像可能产生色带
+- 透明通道会被保留，但精度降低为 1 位（完全透明/完全不透明）
+- 对于 UI 图标、像素艺术等素材效果极佳；对于照片类图像不推荐
+
+#### 文件大小对比示例
+
+| 文件 | 原始（32位 RGBA） | 调色板模式（8位） | 压缩率 |
+|------|-------------------|-------------------|--------|
+| skillicon_001.png | 28 KB | 7 KB | 75% |
+| item_icon.png | 32 KB | 9 KB | 72% |
+| button_bg.png | 45 KB | 12 KB | 73% |
+
+### 3.6 返回码
 
 脚本执行后会返回状态码：
 
@@ -547,6 +604,12 @@ python scripts/batch_process.py -i D:\res -o D:\output --scale 2 --final-size 12
 :: 并行 + 超分降采样 完整示例
 python scripts/batch_process.py -i D:\res -o D:\output --parallel --scale 2 --final-size 120 -r
 
+:: 使用调色板模式压缩（减小文件大小）
+python scripts/batch_process.py -i D:\res -o D:\output --palette
+
+:: 完整流程：超分 + 降采样 + 调色板压缩
+python scripts/batch_process.py -i D:\res -o D:\output --parallel --scale 2 --final-size 120 --palette -r
+
 :: ====== process_by_reference.py 命令 ======
 
 :: 查看匹配文件（不执行）
@@ -557,6 +620,9 @@ python scripts/process_by_reference.py --ref E:\ref --source G:\source --output 
 
 :: 完整命令（8线程 + 递归）
 python scripts/process_by_reference.py --ref E:\ref --source G:\source --output D:\output --scale 2 --final-size 120 --parallel --io-workers 8 --recursive
+
+:: 使用调色板模式压缩
+python scripts/process_by_reference.py --ref E:\ref --source G:\source --output D:\output --scale 2 --final-size 120 --palette --parallel
 ```
 
 ### B. 支持的模型
@@ -570,5 +636,5 @@ python scripts/process_by_reference.py --ref E:\ref --source G:\source --output 
 
 ---
 
-*文档版本：1.3*
+*文档版本：1.4*
 *最后更新：2026-01-09*

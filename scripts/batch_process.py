@@ -34,6 +34,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
+from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
 
 class BatchProcessor:
@@ -42,6 +43,15 @@ class BatchProcessor:
     # 支持的图片格式
     SUPPORTED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
 
+    # 支持的缩放算法
+    RESIZE_METHODS = {
+        'area': cv2.INTER_AREA,        # 抗锯齿，适合一般降采样
+        'lanczos': cv2.INTER_LANCZOS4, # Lanczos 插值，锐度较高
+        'cubic': cv2.INTER_CUBIC,      # 三次插值，平滑
+        'linear': cv2.INTER_LINEAR,    # 双线性插值
+        'nearest': cv2.INTER_NEAREST,  # 最近邻，完全锐利（像素风格）
+    }
+
     def __init__(
         self,
         model_name: str = 'RealESRGAN_x4plus',
@@ -49,7 +59,11 @@ class BatchProcessor:
         tile: int = 0,
         gpu_id: int = None,
         fp32: bool = True,  # 默认使用 FP32，对透明通道图片更稳定
-        final_size: int = None  # 最终输出尺寸（可选，用于超分后降采样）
+        final_size: int = None,  # 最终输出尺寸（可选，用于超分后降采样）
+        output_8bit: bool = False,  # 强制输出为 8-bit 位深度
+        use_palette: bool = False,  # 使用调色板模式压缩
+        face_enhance: bool = False,  # 使用 GFPGAN 进行人脸增强
+        resize_method: str = 'area'  # 缩放算法
     ):
         """
         初始化处理器
@@ -61,6 +75,10 @@ class BatchProcessor:
             gpu_id: GPU ID
             fp32: 是否使用 FP32 精度
             final_size: 最终输出尺寸，如果指定则会在超分后降采样到此尺寸
+            output_8bit: 是否强制输出为 8-bit 位深度（默认保持原始位深度）
+            use_palette: 是否使用调色板模式输出（减小文件大小）
+            face_enhance: 是否使用 GFPGAN 进行人脸增强
+            resize_method: 缩放算法 (area/lanczos/cubic/linear/nearest)
         """
         self.model_name = model_name
         self.scale = scale
@@ -68,7 +86,12 @@ class BatchProcessor:
         self.gpu_id = gpu_id
         self.fp32 = fp32
         self.final_size = final_size
+        self.output_8bit = output_8bit
+        self.use_palette = use_palette
+        self.face_enhance = face_enhance
+        self.resize_method = resize_method
         self.upsampler = None
+        self.face_enhancer = None  # GFPGAN 人脸增强器
 
         # 统计信息
         self.stats = {
@@ -102,6 +125,9 @@ class BatchProcessor:
         elif self.model_name == 'RealESRGAN_x2plus':
             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
             netscale = 2
+        elif self.model_name == 'RealESRNet_x4plus':  # x4 RRDBNet model
+            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+            netscale = 4
         else:
             raise ValueError(f"不支持的模型: {self.model_name}")
 
@@ -130,12 +156,63 @@ class BatchProcessor:
         if self.final_size:
             self._log(f"  - 最终尺寸: {self.final_size}x{self.final_size}")
 
+        # 初始化人脸增强器（如果启用）
+        if self.face_enhance:
+            self._init_face_enhancer()
+
+    def _init_face_enhancer(self):
+        """初始化 GFPGAN 人脸增强器"""
+        try:
+            from gfpgan import GFPGANer
+        except ImportError:
+            self._log("警告: GFPGAN 未安装，人脸增强功能不可用", 'WARNING')
+            self._log("请执行: pip install gfpgan", 'WARNING')
+            self.face_enhance = False
+            return
+
+        self._log("正在初始化人脸增强器 (GFPGAN)...")
+
+        # GFPGAN 模型路径（支持多个版本）
+        # 优先使用本地模型，否则自动下载
+        gfpgan_model_path = PROJECT_ROOT / 'weights' / 'GFPGANv1.3.pth'
+
+        if not gfpgan_model_path.exists():
+            # 尝试其他版本
+            for version in ['GFPGANv1.4.pth', 'GFPGANv1.2.pth']:
+                alt_path = PROJECT_ROOT / 'weights' / version
+                if alt_path.exists():
+                    gfpgan_model_path = alt_path
+                    break
+
+        # 如果本地没有，使用 URL（GFPGAN 会自动下载）
+        if gfpgan_model_path.exists():
+            model_path_str = str(gfpgan_model_path)
+            self._log(f"  - 使用本地模型: {gfpgan_model_path.name}")
+        else:
+            # 使用官方 URL，GFPGAN 会自动下载到 gfpgan/weights
+            model_path_str = 'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth'
+            self._log("  - 本地模型不存在，将自动下载...")
+
+        self.face_enhancer = GFPGANer(
+            model_path=model_path_str,
+            upscale=self.scale,
+            arch='clean',
+            channel_multiplier=2,
+            bg_upsampler=self.upsampler  # 使用 Real-ESRGAN 作为背景增强器
+        )
+
+        self._log("  - 人脸增强器初始化完成")
+
     def _resize_to_final_size(self, img):
         """
         将图像缩放到指定的最终尺寸
 
-        使用 INTER_AREA 进行降采样（最佳抗锯齿效果）
-        保持正方形假设，取最大边缩放到 final_size
+        根据 resize_method 选择不同的插值算法：
+        - area: 抗锯齿，适合一般降采样（默认）
+        - lanczos: Lanczos 插值，锐度较高
+        - cubic: 三次插值，平滑
+        - linear: 双线性插值
+        - nearest: 最近邻，完全锐利（像素风格）
 
         Args:
             img: OpenCV 图像 (numpy array)
@@ -158,9 +235,91 @@ class BatchProcessor:
         new_w = int(w * scale_factor)
         new_h = int(h * scale_factor)
 
-        # 使用 INTER_AREA 进行高质量降采样
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        # 获取插值方法
+        interpolation = self.RESIZE_METHODS.get(self.resize_method, cv2.INTER_AREA)
+
+        resized = cv2.resize(img, (new_w, new_h), interpolation=interpolation)
         return resized
+
+    def _convert_to_8bit(self, img):
+        """
+        将图像转换为 8-bit 位深度
+
+        Real-ESRGAN 可能输出 float32 或 uint16 格式的图像，
+        某些下游工具（如游戏引擎、图片编辑器）只支持 8-bit PNG
+
+        Args:
+            img: OpenCV 图像 (numpy array)
+
+        Returns:
+            8-bit 图像 (dtype=uint8)
+        """
+        import numpy as np
+
+        if not self.output_8bit:
+            return img
+
+        # 已经是 8-bit，直接返回
+        if img.dtype == np.uint8:
+            return img
+
+        # 16-bit 转 8-bit
+        if img.dtype == np.uint16:
+            return (img / 256).astype(np.uint8)
+
+        # float 转 8-bit (假设范围 0-255 或 0-1)
+        if img.dtype in (np.float32, np.float64):
+            if img.max() <= 1.0:
+                return (img * 255).clip(0, 255).astype(np.uint8)
+            else:
+                return img.clip(0, 255).astype(np.uint8)
+
+        # 其他情况尝试直接转换
+        return img.astype(np.uint8)
+
+    def _save_image(self, img, save_path: Path, is_rgba: bool = False):
+        """
+        保存图像，支持调色板模式
+
+        Args:
+            img: OpenCV 图像 (numpy array, BGR/BGRA 格式)
+            save_path: 保存路径
+            is_rgba: 是否为 RGBA 图像
+        """
+        from PIL import Image
+        import numpy as np
+
+        # 确保输出目录存在
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # RGBA 强制保存为 PNG
+        if is_rgba:
+            save_path = save_path.with_suffix('.png')
+
+        if self.use_palette and save_path.suffix.lower() == '.png':
+            # 使用 PIL 保存为调色板模式
+            # OpenCV 是 BGR/BGRA，需要转换为 RGB/RGBA
+            if is_rgba:
+                # BGRA -> RGBA
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+                pil_img = Image.fromarray(img_rgb, mode='RGBA')
+
+                # 转换为调色板模式（带透明度）
+                # 使用自适应调色板，最多256色
+                pil_img = pil_img.convert('P', palette=Image.ADAPTIVE, colors=256)
+            else:
+                # BGR -> RGB
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(img_rgb, mode='RGB')
+
+                # 转换为调色板模式
+                pil_img = pil_img.convert('P', palette=Image.ADAPTIVE, colors=256)
+
+            # 保存（使用最大压缩）
+            pil_img.save(str(save_path), optimize=True)
+        else:
+            # 使用 OpenCV 默认保存
+            cv2.imwrite(str(save_path), img)
 
     def _log(self, message: str, level: str = 'INFO'):
         """输出日志"""
@@ -194,6 +353,64 @@ class BatchProcessor:
         files = sorted(set(files))
         return files
 
+    def _enhance_image(self, img):
+        """
+        对图像执行增强处理（超分辨率 + 可选的人脸增强）
+
+        Args:
+            img: OpenCV 图像 (numpy array, BGR/BGRA 格式)
+
+        Returns:
+            tuple: (output_image, is_rgba)
+                - output_image: 增强后的图像
+                - is_rgba: 是否为 RGBA 图像
+        """
+        # 检测图片模式
+        is_rgba = len(img.shape) == 3 and img.shape[2] == 4
+
+        if self.face_enhance and self.face_enhancer is not None:
+            # 使用 GFPGAN 进行人脸增强
+            # GFPGAN 会自动使用 Real-ESRGAN 作为背景增强器
+            # 注意：GFPGAN 不直接支持 RGBA，需要分离 Alpha 通道
+
+            if is_rgba:
+                # 分离 Alpha 通道
+                img_bgr = img[:, :, :3]
+                alpha = img[:, :, 3]
+
+                # 人脸增强（仅处理 BGR）
+                _, _, output_bgr = self.face_enhancer.enhance(
+                    img_bgr,
+                    has_aligned=False,
+                    only_center_face=False,
+                    paste_back=True
+                )
+
+                # 放大 Alpha 通道
+                h, w = output_bgr.shape[:2]
+                alpha_resized = cv2.resize(alpha, (w, h), interpolation=cv2.INTER_LINEAR)
+
+                # 合并通道
+                output = cv2.merge([
+                    output_bgr[:, :, 0],
+                    output_bgr[:, :, 1],
+                    output_bgr[:, :, 2],
+                    alpha_resized
+                ])
+            else:
+                # 直接处理 BGR 图像
+                _, _, output = self.face_enhancer.enhance(
+                    img,
+                    has_aligned=False,
+                    only_center_face=False,
+                    paste_back=True
+                )
+        else:
+            # 仅使用 Real-ESRGAN 超分辨率
+            output, _ = self.upsampler.enhance(img, outscale=self.scale)
+
+        return output, is_rgba
+
     def _process_single_image(self, input_path: Path, output_path: Path) -> bool:
         """
         处理单张图片
@@ -208,28 +425,17 @@ class BatchProcessor:
                 self._log(f"无法读取图片: {input_path}", 'ERROR')
                 return False
 
-            # 检测图片模式
-            if len(img.shape) == 3 and img.shape[2] == 4:
-                img_mode = 'RGBA'
-            else:
-                img_mode = 'RGB'
-
-            # 执行超分辨率
-            output, _ = self.upsampler.enhance(img, outscale=self.scale)
+            # 执行增强处理
+            output, is_rgba = self._enhance_image(img)
 
             # 如果指定了最终尺寸，进行降采样
             output = self._resize_to_final_size(output)
 
-            # 确保输出目录存在
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # 转换为 8-bit（如果启用）
+            output = self._convert_to_8bit(output)
 
-            # 保存结果（RGBA 图片强制保存为 PNG）
-            if img_mode == 'RGBA':
-                save_path = output_path.with_suffix('.png')
-            else:
-                save_path = output_path
-
-            cv2.imwrite(str(save_path), output)
+            # 保存结果
+            self._save_image(output, output_path, is_rgba)
             return True
 
         except Exception as e:
@@ -514,14 +720,14 @@ class BatchProcessor:
 
                 img, input_file, output_file = item
                 try:
-                    # 检测图片模式
-                    is_rgba = len(img.shape) == 3 and img.shape[2] == 4
-
-                    # GPU 推理
-                    output, _ = self.upsampler.enhance(img, outscale=self.scale)
+                    # 使用统一的增强方法（支持人脸增强）
+                    output, is_rgba = self._enhance_image(img)
 
                     # 如果指定了最终尺寸，进行降采样
                     output = self._resize_to_final_size(output)
+
+                    # 转换为 8-bit（如果启用）
+                    output = self._convert_to_8bit(output)
 
                     # 放入保存队列
                     save_queue.put((output, output_file, is_rgba, input_file))
@@ -545,16 +751,8 @@ class BatchProcessor:
 
                 output_data, output_file, is_rgba, input_file = item
                 try:
-                    # 确保输出目录存在
-                    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-                    # RGBA 强制保存为 PNG
-                    if is_rgba:
-                        save_path = output_file.with_suffix('.png')
-                    else:
-                        save_path = output_file
-
-                    cv2.imwrite(str(save_path), output_data)
+                    # 使用统一的保存方法
+                    self._save_image(output_data, output_file, is_rgba)
 
                     # 更新统计并打印进度
                     count = self._update_stats(True)
@@ -787,9 +985,10 @@ class BatchProcessor:
 
                 img, input_file, output_file = item
                 try:
-                    is_rgba = len(img.shape) == 3 and img.shape[2] == 4
-                    output, _ = self.upsampler.enhance(img, outscale=self.scale)
+                    # 使用统一的增强方法（支持人脸增强）
+                    output, is_rgba = self._enhance_image(img)
                     output = self._resize_to_final_size(output)
+                    output = self._convert_to_8bit(output)
                     save_queue.put((output, output_file, is_rgba, input_file))
                 except Exception as e:
                     self._log(f"处理错误 [{input_file.name}]: {e}", 'ERROR')
@@ -811,9 +1010,8 @@ class BatchProcessor:
 
                 output_data, output_file, is_rgba, input_file = item
                 try:
-                    output_file.parent.mkdir(parents=True, exist_ok=True)
-                    save_path = output_file.with_suffix('.png') if is_rgba else output_file
-                    cv2.imwrite(str(save_path), output_data)
+                    # 使用统一的保存方法
+                    self._save_image(output_data, output_file, is_rgba)
 
                     count = self._update_stats(True)
                     progress = count / actual_total * 100
@@ -919,7 +1117,8 @@ def parse_args():
 
     # 可选参数
     parser.add_argument('--model', type=str, default='RealESRGAN_x4plus',
-                        choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B', 'RealESRGAN_x2plus'],
+                        choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B', 'RealESRGAN_x2plus',
+                        'RealESRNet_x4plus'],
                         help='模型名称 (默认: RealESRGAN_x4plus)')
     parser.add_argument('--scale', type=int, default=4,
                         help='输出放大倍数 (默认: 4)')
@@ -949,6 +1148,17 @@ def parse_args():
     # 后处理选项
     parser.add_argument('--final-size', type=int, default=None,
                         help='最终输出尺寸，超分后会降采样到此尺寸 (例如: 64->128->120)')
+    parser.add_argument('--resize-method', type=str, default='area',
+                        choices=['area', 'lanczos', 'cubic', 'linear', 'nearest'],
+                        help='缩放算法: area(抗锯齿), lanczos(锐利), cubic(平滑), linear, nearest(像素风) (默认: area)')
+    parser.add_argument('--8bit', dest='output_8bit', action='store_true',
+                        help='强制输出为 8-bit 位深度 PNG（某些游戏引擎需要）')
+    parser.add_argument('--palette', action='store_true',
+                        help='使用调色板模式输出 PNG（8-bit 索引色，大幅减小文件大小）')
+
+    # 人脸增强选项
+    parser.add_argument('--face-enhance', action='store_true',
+                        help='使用 GFPGAN 进行人脸增强（需要安装 gfpgan 包）')
 
     return parser.parse_args()
 
@@ -964,7 +1174,11 @@ def main():
         tile=args.tile,
         gpu_id=args.gpu,
         fp32=not args.fp16,
-        final_size=args.final_size
+        final_size=args.final_size,
+        output_8bit=args.output_8bit,
+        use_palette=args.palette,
+        face_enhance=args.face_enhance,
+        resize_method=args.resize_method
     )
 
     # 根据模式选择处理方法
