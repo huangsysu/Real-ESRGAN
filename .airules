@@ -1,0 +1,44 @@
+# AI 编程助手项目规则
+
+## 首次阅读指引
+
+当你首次接触这个项目时，请按以下顺序阅读：
+
+1. **首先阅读**：`AI_GUIDE.md` - AI 专用的项目索引和任务速查
+2. **需要部署时**：`docs/Deployment_Guide.md` - 完整部署和使用指南
+3. **需要修改批处理脚本时**：`scripts/batch_process.py` - 核心处理逻辑
+
+## 项目上下文
+
+这是一个内部部署版本的 Real-ESRGAN，专门用于：
+- 批量处理游戏资源 PNG 图片（带透明通道）
+- 企业级 Jenkins 自动化集成
+- Windows Patch 机器上运行
+
+## 代码规范
+
+- Python 代码使用中文注释
+- 文档使用中文
+- 保持现有代码风格
+
+## 技术限制
+
+- 必须使用 FP32（不要用 FP16）
+- NumPy 版本必须 < 2.0
+- PyTorch 推荐 2.0.1 + CUDA 11.8
+
+## 常用命令
+
+```cmd
+# 激活环境
+.venv\Scripts\activate
+
+# 批量处理
+python scripts/batch_process.py -i <输入> -o <输出> --parallel -r
+
+# 超分+降采样
+python scripts/batch_process.py -i <输入> -o <输出> --scale 2 --final-size 120
+
+# 按参考目录匹配处理（并行 + 超分降采样）
+python scripts/process_by_reference.py --ref <参考目录> --source <源目录> --output <输出> --scale 2 --final-size 120 --parallel
+```
