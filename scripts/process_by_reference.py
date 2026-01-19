@@ -1,21 +1,44 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-根据参考目录筛选并处理图片
+根据参考目录或文件名列表筛选并处理图片
 
 业务场景：
-    REF_DIR 中的 PNG 文件名作为"需要处理"的清单
-    在 SOURCE_DIR 中找到同名文件进行超分辨率处理
-    输出到 OUTPUT_DIR
+    模式1 (参考目录模式):
+        REF_DIR 中的 PNG 文件名作为"需要处理"的清单
+        在 SOURCE_DIR 中找到同名文件进行超分辨率处理
+        输出到 OUTPUT_DIR
+
+    模式2 (文件名列表模式):
+        通过命令行参数 --file-names 或文件 --file-list 提供文件名清单
+        在 SOURCE_DIR 中找到同名文件进行超分辨率处理
+        输出到 OUTPUT_DIR
 
 使用方法:
+    # 模式1: 使用参考目录
     python process_by_reference.py --ref <参考目录> --source <源目录> --output <输出目录>
+
+    # 模式2: 使用文件名列表（命令行）
+    python process_by_reference.py --source <源目录> --output <输出目录> --file-names file1.png file2.png
+
+    # 模式2: 使用文件名列表（文件）
+    python process_by_reference.py --source <源目录> --output <输出目录> --file-list filenames.txt
 
 示例:
     python process_by_reference.py \
         --ref E:\G18\client\cbg\cbg_online\g18cbg_res\res\item \
         --source G:\WorkSpace\Project_duty\Resources\res\item \
         --output D:\output\item
+
+    python process_by_reference.py \
+        --source G:\WorkSpace\Project_duty\Resources\res\item \
+        --output D:\output\item \
+        --file-names icon_001.png icon_002.png icon_003.png
+
+    python process_by_reference.py \
+        --source G:\WorkSpace\Project_duty\Resources\res\item \
+        --output D:\output\item \
+        --file-list D:\filenames.txt
 """
 
 import argparse
@@ -110,6 +133,80 @@ def find_matching_files(ref_dir: Path, source_dir: Path, recursive: bool = False
     return matched
 
 
+def find_files_by_names(source_dir: Path, file_names: list, recursive: bool = False) -> list:
+    """
+    根据文件名列表，在源目录中查找匹配的文件
+
+    Args:
+        source_dir: 源目录（实际要处理的文件位置）
+        file_names: 文件名列表（仅文件名，不含路径）
+        recursive: 是否递归查找
+
+    Returns:
+        list: 匹配的源文件路径列表 [(source_file, relative_path), ...]
+    """
+    # 构建文件名集合（小写，忽略大小写）
+    target_names = set()
+    for name in file_names:
+        name = name.strip()
+        if name:
+            target_names.add(name.lower())
+
+    log(f"文件名列表中有 {len(target_names)} 个唯一文件名")
+
+    # 在源目录中查找匹配的文件
+    # 同样需要去重
+    if recursive:
+        source_files_raw = list(source_dir.rglob('*.png')) + list(source_dir.rglob('*.PNG'))
+    else:
+        source_files_raw = list(source_dir.glob('*.png')) + list(source_dir.glob('*.PNG'))
+
+    # 使用路径字符串去重
+    source_files_seen = set()
+    source_files = []
+    for f in source_files_raw:
+        key = str(f).lower()
+        if key not in source_files_seen:
+            source_files_seen.add(key)
+            source_files.append(f)
+
+    log(f"源目录中共有 {len(source_files)} 个 PNG 文件")
+
+    # 筛选匹配的文件
+    matched = []
+    for sf in source_files:
+        if sf.name.lower() in target_names:
+            # 计算相对路径（用于保持目录结构）
+            try:
+                relative = sf.relative_to(source_dir)
+            except ValueError:
+                relative = Path(sf.name)
+            matched.append((sf, relative))
+
+    log(f"匹配到 {len(matched)} 个需要处理的文件")
+
+    return matched
+
+
+def load_file_names_from_file(file_path: Path) -> list:
+    """
+    从文件中加载文件名列表
+
+    Args:
+        file_path: 文件路径，每行一个文件名
+
+    Returns:
+        list: 文件名列表
+    """
+    file_names = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            name = line.strip()
+            if name and not name.startswith('#'):  # 忽略空行和注释行
+                file_names.append(name)
+    return file_names
+
+
 def process_matched_files(
     matched_files: list,
     output_dir: Path,
@@ -179,12 +276,18 @@ def process_matched_files(
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description='根据参考目录筛选并处理图片',
+        description='根据参考目录或文件名列表筛选并处理图片',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 基本用法
+  # 模式1: 使用参考目录
   python process_by_reference.py --ref E:\\ref\\item --source G:\\source\\item --output D:\\output
+
+  # 模式2: 使用文件名列表（命令行）
+  python process_by_reference.py --source G:\\source\\item --output D:\\output --file-names icon_001.png icon_002.png
+
+  # 模式2: 使用文件名列表（文件）
+  python process_by_reference.py --source G:\\source\\item --output D:\\output --file-list filenames.txt
 
   # 递归查找
   python process_by_reference.py --ref E:\\ref --source G:\\source --output D:\\output --recursive
@@ -195,12 +298,18 @@ def parse_args():
     )
 
     # 必需参数
-    parser.add_argument('--ref', type=str, required=True,
-                        help='参考目录路径（文件名清单来源）')
+    parser.add_argument('--ref', type=str, default=None,
+                        help='参考目录路径（文件名清单来源），与 --file-names/--file-list 二选一')
     parser.add_argument('--source', type=str, required=True,
                         help='源目录路径（实际要处理的文件位置）')
     parser.add_argument('--output', type=str, required=True,
                         help='输出目录路径')
+
+    # 文件名列表参数（与 --ref 二选一）
+    parser.add_argument('--file-names', type=str, nargs='+', default=None,
+                        help='文件名列表（仅文件名，不含路径），与 --ref 二选一')
+    parser.add_argument('--file-list', type=str, default=None,
+                        help='文件名列表文件路径（每行一个文件名），与 --ref 二选一')
 
     # 可选参数
     parser.add_argument('--model', type=str, default='RealESRGAN_x4plus',
@@ -245,14 +354,42 @@ def main():
     """主函数"""
     args = parse_args()
 
-    ref_dir = Path(args.ref).resolve()
     source_dir = Path(args.source).resolve()
     output_dir = Path(args.output).resolve()
 
+    # 确定使用哪种模式
+    has_ref = args.ref is not None
+    has_file_names = args.file_names is not None
+    has_file_list = args.file_list is not None
+
+    # 验证参数：必须提供 --ref 或 --file-names/--file-list 其中之一
+    if not has_ref and not has_file_names and not has_file_list:
+        log("错误: 必须提供 --ref 或 --file-names 或 --file-list 其中之一", 'ERROR')
+        sys.exit(1)
+
+    if has_ref and (has_file_names or has_file_list):
+        log("错误: --ref 不能与 --file-names 或 --file-list 同时使用", 'ERROR')
+        sys.exit(1)
+
+    if has_file_names and has_file_list:
+        log("错误: --file-names 不能与 --file-list 同时使用", 'ERROR')
+        sys.exit(1)
+
     log("=" * 60)
-    log("Real-ESRGAN 按参考目录处理")
+    log("Real-ESRGAN 按参考目录/文件名列表处理")
     log("=" * 60)
-    log(f"参考目录 (REF_DIR)   : {ref_dir}")
+
+    if has_ref:
+        ref_dir = Path(args.ref).resolve()
+        log(f"模式: 参考目录模式")
+        log(f"参考目录 (REF_DIR)   : {ref_dir}")
+    else:
+        log(f"模式: 文件名列表模式")
+        if has_file_names:
+            log(f"文件名列表: 命令行参数 ({len(args.file_names)} 个)")
+        else:
+            log(f"文件名列表文件: {args.file_list}")
+
     log(f"源目录 (SOURCE_DIR)  : {source_dir}")
     log(f"输出目录 (OUTPUT_DIR): {output_dir}")
     log(f"递归查找: {'是' if args.recursive else '否'}")
@@ -260,16 +397,33 @@ def main():
     log("-" * 60)
 
     # 验证目录
-    if not ref_dir.exists():
-        log(f"参考目录不存在: {ref_dir}", 'ERROR')
-        sys.exit(1)
+    if has_ref:
+        ref_dir = Path(args.ref).resolve()
+        if not ref_dir.exists():
+            log(f"参考目录不存在: {ref_dir}", 'ERROR')
+            sys.exit(1)
 
     if not source_dir.exists():
         log(f"源目录不存在: {source_dir}", 'ERROR')
         sys.exit(1)
 
     # 查找匹配文件
-    matched = find_matching_files(ref_dir, source_dir, args.recursive)
+    if has_ref:
+        ref_dir = Path(args.ref).resolve()
+        matched = find_matching_files(ref_dir, source_dir, args.recursive)
+    else:
+        # 获取文件名列表
+        if has_file_names:
+            file_names = args.file_names
+        else:
+            file_list_path = Path(args.file_list).resolve()
+            if not file_list_path.exists():
+                log(f"文件名列表文件不存在: {file_list_path}", 'ERROR')
+                sys.exit(1)
+            file_names = load_file_names_from_file(file_list_path)
+            log(f"从文件中加载了 {len(file_names)} 个文件名")
+
+        matched = find_files_by_names(source_dir, file_names, args.recursive)
 
     if not matched:
         log("未找到任何匹配的文件", 'WARNING')
